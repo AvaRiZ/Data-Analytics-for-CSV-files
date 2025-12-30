@@ -1290,26 +1290,6 @@ elif page == "Recommendations" and st.session_state.df is not None:
             st.write(f"Last search returned {len(prev_results)} recommendations")
             st.write(f"Top match: **{prev_results[0]['name']}** (Score: {prev_results[0]['score']:.2f})")
     
-    # Sample subjects for quick testing
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💡 Sample Subjects")
-    sample_subjects = [
-        "Machine Learning",
-        "Data Science", 
-        "Calculus",
-        "Physics",
-        "Computer Science",
-        "Mathematics",
-        "Statistics",
-        "Engineering",
-        "Biology",
-        "Chemistry"
-    ]
-    
-    for sample in sample_subjects:
-        if st.sidebar.button(f"Try: {sample}"):
-            st.experimental_rerun()  # This will rerun with the sample subject
-    
     # Data requirements
     with st.expander("📋 Data Requirements for Recommendations"):
         st.write("""
