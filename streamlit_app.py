@@ -822,15 +822,4 @@ st.sidebar.info("""
 4. Run clustering, predictions, or recommendations
 """)
 
-# Additional setup instructions
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔧 Setup for Recommendations")
-st.sidebar.write("""
-For the recommendation feature to work optimally:
-
-1. Ensure `ner.py` is in the same directory
-2. Install spaCy: `pip install spacy`
-3. Download the model: `python -m spacy download en_core_web_sm`
-""")
-
 # Run with: streamlit run app.py
