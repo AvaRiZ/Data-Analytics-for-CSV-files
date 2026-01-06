@@ -14,6 +14,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 import io
+from visualization import create_plot
 
 
 # Try to import the ner module
@@ -88,529 +89,17 @@ if 'prediction_results' not in st.session_state:
 if 'recommendation_results' not in st.session_state:
     st.session_state.recommendation_results = None
 
-# Data normalization function (same as your original)
-def normalize_columns(df, for_prediction=False):
-    col_map = {}
-    lower_cols = {c.lower(): c for c in df.columns}
+# Use preprocessing helpers
+from preprocessing import normalize_columns, find_column
 
-    def find_variant(possible):
-        for p in possible:
-            if p.lower() in lower_cols:
-                return lower_cols[p.lower()]
-        for col in df.columns:
-            lower_col = col.lower()
-            for p in possible:
-                if p.lower() in lower_col:
-                    return col
-        return None
+# Use clustering and prediction modules
+from clustering import cluster_students, cluster_faculty
+from prediction import run_predictions
+# Use recommendation helpers
+from recommendation import run_recommendations, simple_recommendation
 
-    # common variants
-    status_col = find_variant(['Status', 'studentstatus', 'student_status', 'enrollment_status', 'state'])
-    hasjob_col = find_variant(['hasjob', 'HasSideJob', 'has_side_jobs', 'hasjobs', 'hassidejobs', 'employed', 'HasSideJobs'])
-    income_col = find_variant(['MonthlyFamilyIncome', 'income', 'pay', 'wage', 'compensation'])
-
-    if status_col:
-        col_map[status_col] = 'Status'
-    if hasjob_col:
-        col_map[hasjob_col] = 'HasSideJob'
-    if income_col:
-        col_map[income_col] = 'MonthlyFamilyIncome'
-
-    if col_map:
-        df = df.rename(columns=col_map)
-
-    # Only normalize Status if NOT doing prediction (to avoid data leakage)
-    if not for_prediction and 'Status' in df.columns:
-        if pd.api.types.is_numeric_dtype(df['Status']):
-            df['Status'] = df['Status'].fillna(0).astype(int).clip(0, 1)
-        else:
-            df['Status'] = df['Status'].astype(str).str.lower().str.strip().apply(
-                lambda x: 1 if 'enrolled' in x else 0
-            ).astype(int)
-
-    # Normalize HasSideJob
-    if 'HasSideJob' in df.columns or 'hasjob' in df.columns:
-        try:
-            if 'hasjob' in df.columns and 'HasSideJob' not in df.columns:
-                df = df.rename(columns={'hasjob': 'HasSideJob'})
-            
-            df['HasSideJob'] = df['HasSideJob'].map(
-                lambda v: 1 if str(v).strip().lower() in ('1', 'true', 'yes', 'y', 't')
-                else (0 if str(v).strip().lower() in ('0', 'false', 'no', 'n', 'f') else v)
-            )
-            df['HasSideJob'] = pd.to_numeric(df['HasSideJob'], errors='coerce').fillna(0).astype(int)
-        except Exception:
-            pass
-
-    # Normalize MonthlyFamilyIncome
-    if 'MonthlyFamilyIncome' in df.columns:
-        if for_prediction:
-            pass
-        else:
-            if not pd.api.types.is_numeric_dtype(df['MonthlyFamilyIncome']):
-                df['MonthlyFamilyIncome'] = df['MonthlyFamilyIncome'].astype('category').cat.codes
-            df['MonthlyFamilyIncome'] = (df['MonthlyFamilyIncome'] - df['MonthlyFamilyIncome'].min()) / (df['MonthlyFamilyIncome'].max() - df['MonthlyFamilyIncome'].min())
-
-    return df
-
-def find_column(df, variants):
-    """Helper function to find columns by variants"""
-    for variant in variants:
-        for col in df.columns:
-            if variant.lower() in col.lower():
-                return col
-    return None
-
-# Clustering functions adapted for Streamlit
-def cluster_students_streamlit(df):
-    """Student clustering for Streamlit"""
-    try:
-        if df is None or df.empty:
-            st.error("No data available for clustering.")
-            return None
-        
-        data = df.copy()
-        
-        # Find columns
-        age_col = find_column(data, ['Age', 'age'])
-        gwa_col = find_column(data, ['GWA', 'gwa', 'Grade', 'grade', 'Score', 'score'])
-        status_col = find_column(data, ['Status', 'status', 'StudentStatus'])
-        year_col = find_column(data, ['Year', 'year', 'YearLevel', 'yearlevel', 'Level', 'level'])
-
-        required_cols = [age_col, gwa_col, status_col, year_col]
-        missing_cols = [f"'{variants[0]}'" for col, variants in 
-                       zip(required_cols, [['Age'], ['GWA'], ['Status'], ['Year']]) 
-                       if col is None]
-        
-        if missing_cols:
-            st.error(f"Missing required columns: {', '.join(missing_cols)}")
-            return None
-
-        # Prepare data
-        cluster_data = data[[age_col, gwa_col, status_col, year_col]].copy()
-        
-        # Convert categorical to numeric
-        if status_col and not pd.api.types.is_numeric_dtype(cluster_data[status_col]):
-            cluster_data[status_col] = cluster_data[status_col].astype('category').cat.codes
-        
-        if year_col and not pd.api.types.is_numeric_dtype(cluster_data[year_col]):
-            cluster_data[year_col] = cluster_data[year_col].astype('category').cat.codes
-
-        # Handle missing values
-        if cluster_data.isnull().any().any():
-            cluster_data = cluster_data.fillna(cluster_data.mean())
-            st.info("Missing values filled with column means")
-
-        # Scale data
-        scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(cluster_data)
-
-        # Elbow method for optimal k
-        inertias = []
-        k_range = range(2, 8)
-        
-        for k in k_range:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans.fit(scaled_data)
-            inertias.append(kmeans.inertia_)
-
-        # Find optimal k (using simple elbow detection)
-        diff = np.diff(inertias)
-        diff_ratio = diff[1:] / diff[:-1]
-        optimal_k = 3 if len(diff_ratio) == 0 else np.argmin(diff_ratio) + 3
-        
-        # Ensure optimal_k is within range
-        optimal_k = min(max(optimal_k, 2), 7)
-
-        # Perform clustering
-        kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(scaled_data)
-        
-        # Add cluster labels
-        data['Student_Cluster'] = clusters
-        
-        # Create results dictionary
-        results = {
-            'data': data,
-            'clusters': clusters,
-            'optimal_k': optimal_k,
-            'age_col': age_col,
-            'gwa_col': gwa_col,
-            'status_col': status_col,
-            'year_col': year_col,
-            'scaled_data': scaled_data,
-            'kmeans': kmeans,
-            'inertias': inertias,
-            'k_range': list(k_range)
-        }
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"An error occurred during student clustering: {e}")
-        return None
-
-def cluster_faculty_streamlit(df):
-    """Faculty clustering for Streamlit"""
-    try:
-        if df is None or df.empty:
-            st.error("No data available for clustering.")
-            return None
-        
-        data = df.copy()
-        
-        # Find columns
-        exp_col = find_column(data, ['Experience', 'experience', 'Exp', 'exp', 'Years', 'years'])
-        load_col = find_column(data, ['TeachingLoad', 'teachingload', 'Load', 'load', 'Teaching', 'teaching'])
-        age_col = find_column(data, ['Age', 'age'])
-
-        required_cols = [exp_col, load_col, age_col]
-        missing_cols = [f"'{variants[0]}'" for col, variants in 
-                       zip(required_cols, [['Experience'], ['TeachingLoad'], ['Age']]) 
-                       if col is None]
-        
-        if missing_cols:
-            st.error(f"Missing required columns: {', '.join(missing_cols)}")
-            return None
-
-        # Prepare data
-        cluster_data = data[[exp_col, load_col, age_col]].copy()
-
-        # Handle missing values
-        if cluster_data.isnull().any().any():
-            cluster_data = cluster_data.fillna(cluster_data.mean())
-            st.info("Missing values filled with column means")
-
-        # Scale data
-        scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(cluster_data)
-
-        # Use 3 clusters for faculty
-        optimal_k = 3
-        
-        # Perform clustering
-        kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(scaled_data)
-        
-        # Add cluster labels with meaningful names
-        cluster_names = {0: 'Low Load', 1: 'Medium Load', 2: 'High Load'}
-        data['Faculty_Cluster'] = [cluster_names.get(cluster, f'Cluster {cluster}') for cluster in clusters]
-        
-        # Create results dictionary
-        results = {
-            'data': data,
-            'clusters': clusters,
-            'optimal_k': optimal_k,
-            'exp_col': exp_col,
-            'load_col': load_col,
-            'age_col': age_col,
-            'cluster_names': cluster_names,
-            'scaled_data': scaled_data,
-            'kmeans': kmeans
-        }
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"An error occurred during faculty clustering: {e}")
-        return None
-
-# Prediction function adapted for Streamlit
-def run_predictions_streamlit(df):
-    """Run student enrollment prediction for Streamlit"""
-    try:
-        if df is None or df.empty:
-            st.error("No data available for predictions.")
-            return None
-        
-        # Show data size info
-        original_size = len(df)
-        
-        # Work on a copy
-        data = df.copy()
-        
-        # Manual normalization
-        if 'Status' in data.columns:
-            if pd.api.types.is_numeric_dtype(data['Status']):
-                data['Status'] = data['Status'].fillna(0).astype(int).clip(0, 1)
-            else:
-                data['Status'] = data['Status'].astype(str).str.lower().str.strip().apply(
-                    lambda x: 1 if 'enrolled' in x else 0
-                ).astype(int)
-
-        # Handle HasSideJob column
-        if 'HasSideJob' in data.columns:
-            data['HasSideJob'] = data['HasSideJob'].map(
-                lambda v: 1 if str(v).strip().lower() in ('1', 'true', 'yes', 'y', 't')
-                else (0 if str(v).strip().lower() in ('0', 'false', 'no', 'n', 'f') else v)
-            )
-            data['HasSideJob'] = pd.to_numeric(data['HasSideJob'], errors='coerce')
-
-        # Handle MonthlyFamilyIncome
-        if 'MonthlyFamilyIncome' in data.columns:
-            if not pd.api.types.is_numeric_dtype(data['MonthlyFamilyIncome']):
-                data['MonthlyFamilyIncome'] = data['MonthlyFamilyIncome'].astype('category').cat.codes
-            # Scale to 0-1 range
-            data['MonthlyFamilyIncome'] = (data['MonthlyFamilyIncome'] - data['MonthlyFamilyIncome'].min()) / (data['MonthlyFamilyIncome'].max() - data['MonthlyFamilyIncome'].min())
-
-        # Check required columns
-        required = ['HasSideJob', 'MonthlyFamilyIncome', 'Status']
-        missing = [c for c in required if c not in data.columns]
-        
-        if missing:
-            st.error(f"Missing required columns for prediction: {', '.join(missing)}")
-            st.info("Looking for alternative column names...")
-            
-            # Try to find alternative columns
-            for col in missing:
-                if col == 'HasSideJob':
-                    alt_col = find_column(data, ['hasjob', 'employed', 'job', 'sidejob'])
-                    if alt_col:
-                        data['HasSideJob'] = data[alt_col]
-                        st.info(f"Using '{alt_col}' as HasSideJob")
-                elif col == 'MonthlyFamilyIncome':
-                    alt_col = find_column(data, ['income', 'pay', 'wage', 'salary', 'compensation'])
-                    if alt_col:
-                        data['MonthlyFamilyIncome'] = data[alt_col]
-                        st.info(f"Using '{alt_col}' as MonthlyFamilyIncome")
-                elif col == 'Status':
-                    alt_col = find_column(data, ['studentstatus', 'enrollment', 'enrolled'])
-                    if alt_col:
-                        data['Status'] = data[alt_col]
-                        st.info(f"Using '{alt_col}' as Status")
-        
-        # Re-check after alternatives
-        missing = [c for c in required if c not in data.columns]
-        if missing:
-            st.error(f"Still missing required columns: {', '.join(missing)}")
-            return None
-
-        # Check for missing values
-        missing_info = data[required].isnull().sum()
-        if missing_info.sum() > 0:
-            st.warning(f"Missing values found:\n{missing_info}\n\nThese rows will be removed.")
-        
-        # Remove rows with missing values
-        data_clean = data[required].dropna()
-        rows_removed = len(data) - len(data_clean)
-        
-        if rows_removed > 0:
-            st.info(f"Removed {rows_removed} rows with missing values")
-        
-        if len(data_clean) == 0:
-            st.error("No data remaining after cleaning!")
-            return None
-
-        # Prepare features and target
-        X = data_clean[['HasSideJob', 'MonthlyFamilyIncome']].copy()
-        y = data_clean['Status'].copy()
-
-        # Check class distribution
-        enrolled_count = y.sum()
-        dropped_count = len(y) - enrolled_count
-        
-        if enrolled_count == 0 or dropped_count == 0:
-            st.error("Need both enrolled and dropped students for prediction.")
-            return None
-
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-
-        # Compute class weights
-        try:
-            class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-            class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
-        except Exception:
-            class_weight_dict = 'balanced'
-
-        # Train model
-        model = RandomForestClassifier(
-            n_estimators=100,
-            random_state=42,
-            class_weight=class_weight_dict,
-            max_depth=5
-        )
-        
-        model.fit(X_train_scaled, y_train)
-
-        # Cross-validation
-        cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='accuracy')
-        
-        # Predictions
-        y_pred = model.predict(X_test_scaled)
-        X_full_scaled = scaler.transform(X)
-        y_pred_full = model.predict(X_full_scaled)
-
-        # Calculate metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        full_accuracy = accuracy_score(y, y_pred_full)
-
-        # Confusion matrix
-        cm = confusion_matrix(y, y_pred_full)
-        
-        # Create results dictionary
-        results = {
-            'original_size': original_size,
-            'clean_size': len(data_clean),
-            'rows_removed': rows_removed,
-            'X_train_size': len(X_train),
-            'X_test_size': len(X_test),
-            'enrolled_count': enrolled_count,
-            'dropped_count': dropped_count,
-            'enrolled_percentage': enrolled_count/len(y)*100,
-            'dropped_percentage': dropped_count/len(y)*100,
-            'y_train_enrolled': y_train.sum(),
-            'y_train_dropped': len(y_train) - y_train.sum(),
-            'accuracy': accuracy,
-            'cv_scores': cv_scores,
-            'full_accuracy': full_accuracy,
-            'feature_importance': model.feature_importances_,
-            'y_pred_full': y_pred_full,
-            'confusion_matrix': cm,
-            'model': model,
-            'X': X,
-            'y': y,
-            'y_pred': y_pred,
-            'X_train': X_train,
-            'X_test': X_test,
-            'y_train': y_train,
-            'y_test': y_test,
-            'data_clean': data_clean
-        }
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"An error occurred during prediction: {e}")
-        import traceback
-        st.error(traceback.format_exc())
-        return None
-
-# Recommendation function for Streamlit
-def run_recommendations_streamlit(df, subject, top_n=10):
-    """Run faculty recommendation for Streamlit"""
-    try:
-        if df is None or df.empty:
-            st.error("No data available for recommendations.")
-            return None
-        
-        if not NER_AVAILABLE:
-            st.error("NER module not available. Please ensure ner.py is in the same directory.")
-            return None
-        
-        # Run recommendation using ner module
-        recommendations = ner.rank_faculty(
-            df=df,
-            subject=subject,
-            top_n=top_n
-        )
-        
-        return recommendations
-        
-    except Exception as e:
-        st.error(f"An error occurred during recommendation: {e}")
-        import traceback
-        st.error(traceback.format_exc())
-        return None
-
-# Alternative simple recommendation function (if NER module is not available)
-def simple_recommendation(df, subject, top_n=10):
-    """Simple text-based recommendation as fallback"""
-    try:
-        if df is None or df.empty:
-            return None
-        
-        # Find text column
-        text_column = None
-        cols_lower = [c.lower() for c in df.columns]
-        
-        # Look for text columns
-        for cand in ("bio", "description", "profile", "details", "about", "summary", 
-                    "expertise", "field", "specialization", "skills"):
-            for i, c in enumerate(cols_lower):
-                if cand in c:
-                    text_column = df.columns[i]
-                    break
-            if text_column:
-                break
-        
-        # Find name column
-        name_column = None
-        for cand in ("name", "faculty", "professor", "instructor", "staff"):
-            for i, c in enumerate(cols_lower):
-                if cand in c:
-                    name_column = df.columns[i]
-                    break
-            if name_column:
-                break
-        
-        if not text_column:
-            # Fallback to first column
-            text_column = df.columns[0]
-        
-        if not name_column:
-            # Fallback to second column or first if only one column
-            name_column = df.columns[1] if len(df.columns) > 1 else df.columns[0]
-        
-        subject_lower = subject.lower()
-        results = []
-        
-        for idx, row in df.iterrows():
-            text = str(row.get(text_column, ""))
-            name = str(row.get(name_column, f"Faculty {idx}"))
-            text_lower = text.lower()
-            
-            # Simple scoring based on keyword matches
-            score = text_lower.count(subject_lower) * 3
-            
-            # Count individual word matches
-            subject_words = subject_lower.split()
-            for word in subject_words:
-                if len(word) > 3:  # Ignore short words
-                    score += text_lower.count(word)
-            
-            # Add extra information if available
-            age = row.get('Age', 'N/A')
-            gender = row.get('Gender', 'N/A')
-            experience = row.get('YearsExperience', row.get('Experience', 'N/A'))
-            field = row.get('FieldOfExpertise', text[:100] + "...")
-            
-            results.append({
-                "name": name,
-                "score": float(score),
-                "text": text,
-                "index": idx,
-                "age": age,
-                "gender": gender,
-                "years_experience": experience,
-                "field_of_expertise": field
-            })
-        
-        # Sort by score
-        results = sorted(results, key=lambda x: x["score"], reverse=True)
-        return results[:top_n]
-        
-    except Exception as e:
-        st.error(f"Error in simple recommendation: {e}")
-        return None
-
-# File upload function
-def upload_file():
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.session_state.df = df
-        st.session_state.processed_df = df.copy()
-        st.success(f"File uploaded successfully! Shape: {df.shape}")
-        return df
-    return None
+# Use file upload helper
+from file_io import upload_file
 
 # Sidebar navigation - ADDED RECOMMENDATIONS
 st.sidebar.title("Navigation")
@@ -694,29 +183,8 @@ elif page == "Visualization" and st.session_state.df is not None:
         chart_type = st.selectbox("Chart type", 
                                  ["Scatter", "Line", "Bar", "Histogram", "Box", "Heatmap"])
     
-    # Plot
-    fig = None
-    
-    if chart_type == "Scatter":
-        fig = px.scatter(df, x=x_column, y=y_column, title=f"{x_column} vs {y_column}")
-    
-    elif chart_type == "Line":
-        fig = px.line(df, x=x_column, y=y_column, title=f"{x_column} vs {y_column}")
-    
-    elif chart_type == "Bar":
-        fig = px.bar(df, x=x_column, y=y_column, title=f"{x_column} vs {y_column}")
-    
-    elif chart_type == "Histogram":
-        fig = px.histogram(df, x=x_column, title=f"Distribution of {x_column}")
-    
-    elif chart_type == "Box":
-        fig = px.box(df, x=x_column, y=y_column, title=f"Box plot of {y_column} by {x_column}")
-    
-    elif chart_type == "Heatmap":
-        numeric_df = df.select_dtypes(include=[np.number])
-        if not numeric_df.empty:
-            corr = numeric_df.corr()
-            fig = px.imshow(corr, title="Correlation Heatmap")
+    # Plot using helper
+    fig = create_plot(df, x_column, y_column, chart_type)
     
     if fig:
         st.plotly_chart(fig, use_container_width=True)
@@ -747,7 +215,7 @@ elif page == "Clustering" and st.session_state.df is not None:
         
         if st.button("Run Student Clustering", type="primary"):
             with st.spinner("Clustering students..."):
-                results = cluster_students_streamlit(df)
+                results = cluster_students(df)
                 
                 if results:
                     st.session_state.clustering_results = results
@@ -846,7 +314,7 @@ elif page == "Clustering" and st.session_state.df is not None:
         
         if st.button("Run Faculty Clustering", type="primary"):
             with st.spinner("Clustering faculty..."):
-                results = cluster_faculty_streamlit(df)
+                results = cluster_faculty(df)
                 
                 if results:
                     st.session_state.clustering_results = results
@@ -943,7 +411,7 @@ elif page == "Predictions" and st.session_state.df is not None:
     
     if st.button("Run Enrollment Predictions", type="primary"):
         with st.spinner("Training model and making predictions..."):
-            results = run_predictions_streamlit(st.session_state.df)
+            results = run_predictions(st.session_state.df)
             
             if results:
                 st.session_state.prediction_results = results
@@ -1138,19 +606,8 @@ elif page == "Recommendations" and st.session_state.df is not None:
     if subject:
         if st.button("Find Recommendations", type="primary"):
             with st.spinner("Analyzing faculty profiles..."):
-                # Use NER module if available, otherwise use simple matching
-                if NER_AVAILABLE:
-                    recommendations = run_recommendations_streamlit(
-                        st.session_state.df, 
-                        subject, 
-                        top_n=top_n
-                    )
-                else:
-                    recommendations = simple_recommendation(
-                        st.session_state.df,
-                        subject,
-                        top_n=top_n
-                    )
+                # Use recommendation helper (handles NER fallback internally)
+                recommendations = run_recommendations(st.session_state.df, subject, top_n=top_n)
                 
                 if recommendations:
                     st.session_state.recommendation_results = recommendations
